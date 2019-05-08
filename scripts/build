@@ -1,0 +1,224 @@
+#!/usr/bin/env bash
+# This script replaces our old "make" command line - instead of
+# "make mode=debug image=rogue", use "build mode=debug image=rogue".
+# This first runs "make" with the same parameters, and then builds
+# the requested image.
+
+trap 'echo "$0 failed: $BASH_COMMAND" >&2; exit $?' ERR
+
+# If "MAKEFLAGS" is set, we've been run from "make". The following hacks
+# allows our Makefile to forward "make image=..." requests to to us
+# without running into an infinite loop when we call "make".
+MAKEFLAGS=${MAKEFLAGS/ image=/ zzz=}
+MAKEFLAGS=${MAKEFLAGS/#image=/zzz=}
+MAKEFLAGS=${MAKEFLAGS/ modules=/ zzz=}
+MAKEFLAGS=${MAKEFLAGS/#modules=/zzz=}
+unset image modules
+
+# Pass to "make" all the given args except "image=..." or "module=..."
+declare -a args
+# Make is going to be invoked twice. At the first run ("stage1") we
+# build all possible dependencies any app or module might require. At
+# the second - the loader.elf is linked and the loader.img is
+# produced.  In the case of "make clean", the first invocation (and
+# the only one) is used for cleaning up the kernel.
+stage1_args="stage1"
+for i
+do
+	case $i in
+	image=*|modules=*|fs=*|usrskel=*|check) ;;
+	clean)
+		stage1_args=clean ;;
+	*)	# yuck... Is there a prettier way to append to array?
+		args[${#args[@]}]="$i" ;;
+	esac
+done
+
+make "${args[@]}" ${stage1_args} | tee build.out
+# check exit status of make
+status=${PIPESTATUS[0]}
+if [ $status -ne 0 ]
+then
+	echo "make failed. Exiting from build script"
+	exit $status
+fi
+
+for i
+do
+	case $i in
+	clean)	# "build clean" is like "make clean" to clean the kernel,
+		# plus additional cleanups of all modules.
+		set -x
+		OSV_BASE=`pwd` ./scripts/module.py clean -q
+		exit;;
+	esac
+done
+
+# Find out where "make" decided to put its compilation results. We'll
+# put the images in the same place.
+if test ! -L build/last -o ! -f build/last/loader.o
+then
+	echo "'make stage1' did not leave expected results" >&2
+	exit 2
+fi
+OUT=build/`readlink build/last`
+
+# Look for arguments that look like "name=value", and set them in an
+# assoative array "vars". Also look for the "-j ..." parallelism option,
+# which we want to pass to the module's Makefile as well.
+declare -A vars
+j_arg=
+checknumber=
+for i
+do
+	if test -n "$checknumber"
+	then
+		checknumber=
+		case $i in
+		[0-9]*)
+			j_arg="-j$i"
+			continue;;
+		esac
+	fi
+	case $i in
+	*=*)	name=${i%%=*}
+		value=${i#*=}
+		vars[$name]=$value;;
+	-j)
+		# module.py's command line parser has trouble of parsing a
+		# "-j" option without a value. Help it with a fake value "-".
+		j_arg="-j-"
+		# make allows the "-j" option to be separated from the number by a
+		# space (e.g., "-j 4"), but since this number is optional, we will
+		# need to also check the next argument, whether it is a number.
+		checknumber=yes;;
+	-j*)	j_arg=$i;;
+	check)	# "build check" is a shortcut for
+		# "build image=tests; scripts/test.py"
+		vars[image]=tests;;
+	esac
+done
+
+# fs_size_mb is in megabytes (1024*1024 bytes)
+fs_size_mb=${vars[fs_size_mb]-256}
+# fs_size is in bytes
+fs_size=${vars[fs_size]-$(($fs_size_mb*1024*1024))}
+# size must be a multiple of 512. Round it down
+fs_size=$((fs_size - (fs_size & 511)))
+
+SRC=`pwd`
+arch=`expr $OUT : '.*\.\(.*\)'`
+mode=`expr $OUT : '.*/\(.*\)\..*'`
+
+# Set "modules" according to the image= or modules= paramters, or some
+# defaults (with same rules as in our old makefile)
+case $arch in
+aarch64) image=${vars[image]-uush};;
+*) image=${vars[image]-default};;
+esac
+modules=${vars[modules]-!$image}
+
+# TODO: some modules need these... Would be better if they wouldn't...
+jdkbase=${vars[jdkbase]-`find "$SRC"/external/$arch/openjdk.bin/usr/lib/jvm -maxdepth 1 -type d -name 'java*'`}
+gccbase=${vars[gccbase]-"$SRC"/external/$arch/gcc.bin}
+glibcbase=${vars[glibcbase]-"$SRC"/external/$arch/glibc.bin}
+miscbase=${vars[miscbase]-"$SRC"/external/$arch/misc.bin}
+
+case $OUT in
+/*)	OSV_BUILD_PATH=$OUT;;
+*)	OSV_BUILD_PATH=`pwd`/$OUT;;
+esac
+
+# Default manifest
+manifest=$OUT/bootfs.manifest
+fs_type=${vars[fs]-zfs}
+usrskel_arg=
+case $fs_type in
+zfs);; # Nothing to change here. This is our default behavior
+rofs)	manifest=bootfs_empty.manifest.skel
+	usrskel_arg="--usrskel usr_rofs.manifest.skel";;
+ramfs)	manifest=$OUT/usr.manifest
+	usrskel_arg="--usrskel usr_ramfs.manifest.skel";;
+*)	echo "Unknown filesystem \"$fs_type\"" >&2
+	exit 2
+esac
+
+if test -n "${vars[usrskel]}"
+then
+	# Override default skel
+	usrskel_arg="--usrskel ${vars[usrskel]}"
+fi
+
+export=${vars[export]-none}
+if [ "$export" == "selected" ]
+then
+	no_required_arg="--no-required"
+fi
+fs_type=$fs_type jdkbase=$jdkbase ARCH=$arch mode=$mode OSV_BASE=$SRC OSV_BUILD_PATH=$OSV_BUILD_PATH scripts/module.py $j_arg build -c "$modules" $usrskel_arg $no_required_arg
+
+bootfs_manifest=$manifest make "${args[@]}" | tee -a build.out
+# check exit status of make
+status=${PIPESTATUS[0]}
+if [ $status -ne 0 ]
+then
+	echo "make failed. Exiting from build script"
+	exit $status
+fi
+
+if test ! -f build/last/loader.img
+then
+	echo "'make' did not leave expected results" >&2
+	exit 2
+fi
+
+loader_size=`stat --printf %s $OUT/loader.img`
+kernel_end=$(($loader_size+2097151 & ~2097151))
+
+# The python scripts called below assume the current directory is $OUT (as was
+# the case in our old build.mk).
+cd $OUT
+
+case $fs_type in
+zfs)
+	cp loader.img bare.raw
+	zfs_size=$(($fs_size - $kernel_end))
+	"$SRC"/scripts/imgedit.py setpartition "-f raw bare.raw" 2 $kernel_end $zfs_size
+
+	qemu-img convert -f raw -O qcow2 bare.raw usr.img
+	qemu-img resize usr.img ${fs_size}b >/dev/null 2>&1
+
+	if [ "$export" == "none" ]
+	then
+		"$SRC"/scripts/upload_manifest.py -o usr.img -m usr.manifest -D jdkbase="$jdkbase" -D gccbase="$gccbase" -D glibcbase="$glibcbase" -D miscbase="$miscbase"
+	else
+		export_dir=${vars[export_dir]-$SRC/build/export}
+		"$SRC"/scripts/export_manifest.py -e "$export_dir" -m usr.manifest -D jdkbase="$jdkbase" -D gccbase="$gccbase" -D glibcbase="$glibcbase" -D miscbase="$miscbase"
+	fi
+	;;
+rofs)
+	rm -rf rofs.img
+	"$SRC"/scripts/gen-${fs_type}-img.py -o rofs.img -m usr.manifest -D jdkbase="$jdkbase" -D gccbase="$gccbase" -D glibcbase="$glibcbase" -D miscbase="$miscbase"
+	rofs_size=`stat --printf %s rofs.img`
+	img_size=$((kernel_end + rofs_size))
+	cp loader.img bare.raw
+	"$SRC"/scripts/imgedit.py setpartition "-f raw bare.raw" 2 $kernel_end $rofs_size
+	qemu-img resize bare.raw ${img_size}b >/dev/null 2>&1
+	dd if=rofs.img of=bare.raw obs=${kernel_end} seek=1 >/dev/null 2>&1
+	qemu-img convert -f raw -O qcow2 bare.raw usr.img
+	;;
+ramfs)
+	qemu-img convert -f raw -O qcow2 loader.img usr.img
+	;;
+esac
+
+"$SRC"/scripts/imgedit.py setargs usr.img `cat cmdline`
+
+# Support "build check"
+for i
+do
+	case $i in
+	check)	set -x
+		cd "$SRC"
+		exec ./scripts/test.py
+	esac
+done
